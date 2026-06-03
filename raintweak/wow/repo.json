@@ -1,0 +1,11 @@
+{
+  "$meta": {
+    "name": "wow plugins",
+    "description": "Personal Kettu plugin repository"
+  },
+  "wow": {
+    "name": "Wow",
+    "description": "[v1.1.0] Wow: swap user identities locally — avatar, username, display name, badges, banner, bio, pronouns, premium.",
+    "hash": "REPLACED_AT_BUILD_TIME"
+  }
+}
