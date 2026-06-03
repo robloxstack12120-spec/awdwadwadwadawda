@@ -1,7 +1,7 @@
 {
   "name": "Wow",
-  "description": "[v1.1.0] Wow: swap user identities locally — avatar, username, display name, badges, banner, bio, pronouns, premium.",
-  "authors": [{ "name": "hello156165 (v1.1.0)" }],
+  "description": "[v2.0.0] Wow: swap user identities locally — avatar, username, display name, badges, banner, bio, pronouns, premium, nitro theme.",
+  "authors": [{ "name": "hello156165 (v2.0.0)" }],
   "main": "index.js",
   "hash": "REPLACED_AT_BUILD_TIME",
   "vendetta": {
