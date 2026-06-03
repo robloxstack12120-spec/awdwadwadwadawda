@@ -8,6 +8,7 @@ var View = RN.View;
 var Text = RN.Text;
 var TextInput = RN.TextInput;
 var ScrollView = RN.ScrollView;
+var TouchableOpacity = RN.TouchableOpacity;
 var Pressable = RN.Pressable || RN.TouchableOpacity;
 var Image = RN.Image;
 var findByStoreName = vendetta.metro.findByStoreName;
@@ -69,6 +70,7 @@ var lastPresenceRequestBySourceUserId = new Map();
 var suppressUserUpdateEvents = 0;
 var isSyncing = false;
 var syncQueued = false;
+var inGetAliasedUserView = 0;
 var nextRestRequestAt = 0;
 var restQueue = Promise.resolve();
 
@@ -1012,9 +1014,14 @@ function pickGuildTagFields(source) {
 
 function getAliasedUserView(user, opts) {
     opts = opts || {};
-    if (!user || !user.id) return user;
+    if (!user) return user;
+    // Prevent re-entrant Proxy wrapping (stops stack overflow)
+    if (inGetAliasedUserView > 0) return user;
+    // Unwrap any existing Proxy to get the raw underlying user object
+    var rawUser = unwrapAliasedUserProxy(user) || user;
+    if (!rawUser || !rawUser.id) return user;
 
-    var targetId = user.id;
+    var targetId = rawUser.id;
     var sourceUser = sourceUsersByTargetId.get(targetId);
     var sourceProfile = sourceProfilesByTargetId.get(targetId) || null;
     var sourceSnapshot = sourceSnapshotsByTargetId.get(targetId);
@@ -1023,14 +1030,16 @@ function getAliasedUserView(user, opts) {
     var cacheKeySource = sourceProfile || sourceUser || sourceSnapshot || null;
     var viewCache = opts.preserveAccountFields ? aliasedCurrentUserViews : aliasedUserViews;
     var cachedView = viewCache.get(targetId);
-    if (cachedView && cachedView.target === user && cachedView.source === cacheKeySource) {
+    if (cachedView && cachedView.target === rawUser && cachedView.source === cacheKeySource) {
         return cachedView.proxy;
     }
 
+    inGetAliasedUserView++;
+    try {
     var mp = buildMirroredProfileData(sourceUser, sourceProfile, sourceSnapshot, (sourceProfile) || (sourceSnapshot ? sourceSnapshot.rawProfile : null));
     var hasPrem = hasMirroredPremiumProfile(mp);
 
-    var proxy = new Proxy(user, {
+    var proxy = new Proxy(rawUser, {
         get: function (target, prop, receiver) {
             // Preserve account-critical fields for current user
             if (opts.preserveAccountFields && typeof prop === "string") {
@@ -1112,9 +1121,10 @@ function getAliasedUserView(user, opts) {
         }
     });
 
-    aliasProxyToUnderlying.set(proxy, user);
-    viewCache.set(targetId, { target: user, source: cacheKeySource, proxy: proxy });
+    aliasProxyToUnderlying.set(proxy, rawUser);
+    viewCache.set(targetId, { target: rawUser, source: cacheKeySource, proxy: proxy });
     return proxy;
+    } finally { inGetAliasedUserView--; }
 }
 
 // ─── Snapshot Helpers ────────────────────────────────────────────────────
@@ -1537,7 +1547,7 @@ async function applyAlias(alias, nextAP, nextSP, nextSU, nextSS, prevAP, prevSP,
     if (sourceSnap) nextSS.set(alias.targetUserId, sourceSnap);
     var sourceRecord = sourceProfile || (sourceSnap ? sourceSnap.rawProfile : null) || null;
     var mp2 = buildMirroredProfileData(sourceUser, sourceProfile, sourceSnap, sourceRecord);
-    if (sourceUser) nextSU.set(alias.targetUserId, sourceUser);
+    if (sourceUser) nextSU.set(alias.targetUserId, unwrapAliasedUserProxy(sourceUser) || sourceUser);
     if (sourceProfile && sourceUser) nextSP.set(alias.targetUserId, sourceProfile);
     var ap2 = buildAliasedProfile(alias.targetUserId, mp2, sourceRecord) || prevAP.get(alias.targetUserId) || null;
     if (ap2) nextAP.set(alias.targetUserId, ap2);
@@ -2173,13 +2183,14 @@ var C = {
 
 function Settings() {
     var _s = storage;
-    var aliases = normalizeAliases(_s.aliases);
     var forceUpdate = React.useState(0);
     var setUpdate = forceUpdate[1];
     function refresh() { setUpdate(function (x) { return x + 1; }); }
 
-    var draftTarget = React.useRef("");
-    var draftSource = React.useRef("");
+    var aliases = normalizeAliases(_s.aliases);
+    var draftState = React.useState({ target: "", source: "" });
+    var draft = draftState[0];
+    var setDraft = draftState[1];
     var previewMap = React.useState({});
     var pMap = previewMap[0];
     var setPMap = previewMap[1];
@@ -2190,8 +2201,8 @@ function Settings() {
     React.useEffect(function () {
         var ids = [];
         aliases.forEach(function (a) { ids.push(a.targetUserId, a.sourceUserId); });
-        var t = draftTarget.current ? extractUserId(draftTarget.current) : null;
-        var s = draftSource.current ? extractUserId(draftSource.current) : null;
+        var t = draft.target ? extractUserId(draft.target) : null;
+        var s = draft.source ? extractUserId(draft.source) : null;
         if (t) ids.push(t);
         if (s) ids.push(s);
         ids = Array.from(new Set(ids.filter(Boolean)));
@@ -2202,11 +2213,11 @@ function Settings() {
             entries.forEach(function (e) { m[e[0]] = e[1]; });
             setPMap(m);
         });
-    }, [aliases]);
+    }, [aliases, draft.target, draft.source]);
 
     function addAlias() {
-        var tid = extractUserId(draftTarget.current);
-        var sid = extractUserId(draftSource.current);
+        var tid = extractUserId(draft.target);
+        var sid = extractUserId(draft.source);
         if (!tid || !sid) { showToast("enter valid ids", getAssetIDByName("Small")); return; }
         if (tid === sid) { showToast("use two different users", getAssetIDByName("Small")); return; }
         if (aliases.some(function (a) { return a.targetUserId === tid && a.sourceUserId === sid; })) {
@@ -2221,8 +2232,7 @@ function Settings() {
             }
             var enable = !aliases.some(function (a) { return a.enabled && a.targetUserId === tid; });
             _s.aliases = normalizeAliases(_s.aliases).concat([createAlias(tid, sid, enable)]);
-            draftTarget.current = "";
-            draftSource.current = "";
+            setDraft({ target: "", source: "" });
             if (!enable) showToast("saved disabled (user already active)", getAssetIDByName("Check"));
             refreshAliases();
             refresh();
@@ -2231,14 +2241,14 @@ function Settings() {
         }).finally(function () { setSaving(false); });
     }
 
-    function toggleEnabled(alias, checked) {
+    function toggleEnabled(aliasId, aliasTargetUserId, checked) {
         if (checked) {
             _s.aliases = normalizeAliases(_s.aliases).map(function (a) {
-                return Object.assign({}, a, { enabled: a.id === alias.id ? true : a.targetUserId === alias.targetUserId ? false : a.enabled });
+                return Object.assign({}, a, { enabled: a.id === aliasId ? true : a.targetUserId === aliasTargetUserId ? false : a.enabled });
             });
         } else {
             _s.aliases = normalizeAliases(_s.aliases).map(function (a) {
-                return a.id === alias.id ? Object.assign({}, a, { enabled: false }) : a;
+                return a.id === aliasId ? Object.assign({}, a, { enabled: false }) : a;
             });
         }
         refreshAliases();
@@ -2281,45 +2291,48 @@ function Settings() {
         React.createElement(Text, { style: { color: C.text, fontSize: 20, fontWeight: "700" } }, "Wow"),
         React.createElement(Text, { style: { color: C.muted, fontSize: 13, marginTop: 2, marginBottom: 16 } }, "Swap user identities locally."),
         section("New Swap", React.createElement(View, null,
-            React.createElement(View, { style: { flexDirection: "row", gap: 8, marginBottom: 8 } },
-                React.createElement(View, { style: { flex: 1 } },
+            React.createElement(View, { style: { flexDirection: "row", marginBottom: 8 } },
+                React.createElement(View, { style: { flex: 1, marginRight: 4 } },
                     React.createElement(TextInput, {
                         style: { backgroundColor: C.inset, color: C.text, borderRadius: 6, borderWidth: 1, borderColor: "#111214", paddingHorizontal: 10, paddingVertical: 9, fontSize: 15 },
                         placeholder: "user to change", placeholderTextColor: "#6d6f78",
                         autoCorrect: false, autoCapitalize: "none",
-                        defaultValue: draftTarget.current,
-                        onChangeText: function (v) { draftTarget.current = v; }
+                        value: draft.target,
+                        onChangeText: function (v) { setDraft(function (d) { return { target: v, source: d.source }; }); }
                     })),
-                React.createElement(View, { style: { flex: 1 } },
+                React.createElement(View, { style: { flex: 1, marginLeft: 4 } },
                     React.createElement(TextInput, {
                         style: { backgroundColor: C.inset, color: C.text, borderRadius: 6, borderWidth: 1, borderColor: "#111214", paddingHorizontal: 10, paddingVertical: 9, fontSize: 15 },
                         placeholder: "user to copy", placeholderTextColor: "#6d6f78",
                         autoCorrect: false, autoCapitalize: "none",
-                        defaultValue: draftSource.current,
-                        onChangeText: function (v) { draftSource.current = v; }
+                        value: draft.source,
+                        onChangeText: function (v) { setDraft(function (d) { return { target: d.target, source: v }; }); }
                     }))),
-            React.createElement(Pressable, {
+            React.createElement(TouchableOpacity, {
                 onPress: addAlias,
-                style: { backgroundColor: isSaving ? C.bg2 : C.brand, borderRadius: 6, paddingVertical: 10, paddingHorizontal: 14, alignItems: "center", opacity: isSaving ? 0.5 : 1 }
+                activeOpacity: 0.7,
+                style: { backgroundColor: isSaving ? C.bg2 : C.brand, borderRadius: 6, paddingVertical: 10, paddingHorizontal: 14, alignItems: "center" }
             }, React.createElement(Text, { style: { color: "#fff", fontSize: 13, fontWeight: "600" } }, isSaving ? "saving..." : "save swap")))),
         section("Saved (" + aliases.length + ")", aliases.length === 0
             ? React.createElement(View, { style: { borderWidth: 1, borderColor: C.line, borderRadius: 6, borderStyle: "dashed", backgroundColor: C.bg2, padding: 12, alignItems: "center" } },
                 React.createElement(Text, { style: { color: C.muted, fontSize: 13 } }, "no swaps yet."))
             : React.createElement(View, null, aliases.map(function (alias) {
                 var hasConflict = !alias.enabled && aliases.some(function (a) { return a.id !== alias.id && a.enabled && a.targetUserId === alias.targetUserId; });
-                return React.createElement(View, { key: alias.id, style: { flexDirection: "row", alignItems: "center", backgroundColor: C.bg2, borderWidth: 1, borderColor: C.line, borderRadius: 6, padding: 10, marginBottom: 6, gap: 8 } },
-                    React.createElement(View, { style: { flexDirection: "row", flex: 1, alignItems: "center", gap: 6, minWidth: 0 } },
+                return React.createElement(View, { key: alias.id, style: { flexDirection: "row", alignItems: "center", backgroundColor: C.bg2, borderWidth: 1, borderColor: C.line, borderRadius: 6, padding: 10, marginBottom: 6 } },
+                    React.createElement(View, { style: { flexDirection: "row", flex: 1, alignItems: "center", minWidth: 0 } },
                         renderUserLine(alias.targetUserId),
-                        React.createElement(Text, { style: { color: C.muted, fontSize: 12, fontWeight: "700" } }, "→"),
+                        React.createElement(Text, { style: { color: C.muted, fontSize: 12, fontWeight: "700", marginHorizontal: 6 } }, "→"),
                         renderUserLine(alias.sourceUserId)),
-                    React.createElement(View, { style: { flexDirection: "row", alignItems: "center", gap: 8 } },
-                        React.createElement(Pressable, {
-                            onPress: function () { toggleEnabled(alias, !alias.enabled); },
+                    React.createElement(View, { style: { flexDirection: "row", alignItems: "center" } },
+                        React.createElement(TouchableOpacity, {
+                            onPress: function () { toggleEnabled(alias.id, alias.targetUserId, !alias.enabled); },
+                            activeOpacity: 0.7,
                             style: { width: 36, height: 20, borderRadius: 10, backgroundColor: alias.enabled ? C.green : C.line, alignItems: "center", justifyContent: alias.enabled ? "flex-end" : "flex-start", paddingHorizontal: 2 }
                         }, React.createElement(View, { style: { width: 16, height: 16, borderRadius: 8, backgroundColor: "#fff" } })),
-                        React.createElement(Pressable, {
+                        React.createElement(TouchableOpacity, {
                             onPress: function () { deleteAlias(alias.id); },
-                            style: { backgroundColor: C.danger, borderRadius: 6, paddingVertical: 6, paddingHorizontal: 10 }
+                            activeOpacity: 0.7,
+                            style: { backgroundColor: C.danger, borderRadius: 6, paddingVertical: 6, paddingHorizontal: 10, marginLeft: 8 }
                         }, React.createElement(Text, { style: { color: "#fff", fontSize: 12, fontWeight: "600" } }, "del"))),
                     hasConflict ? React.createElement(Text, { style: { color: "#faa81a", fontSize: 11, marginTop: 2 } }, "another swap for this user is active") : null);
             }))));
