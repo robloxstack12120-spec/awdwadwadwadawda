@@ -2172,170 +2172,155 @@ function refreshAliases() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Settings UI
+//  Settings UI — larp-style: storage-driven, no async in render path
 // ═══════════════════════════════════════════════════════════════════════════
 
 var C = {
-    bg: "#2b2d31", bg2: "#1e1f22", inset: "#111214",
-    text: "#f2f3f5", muted: "#949ba4", brand: "#5865f2",
-    danger: "#ed4245", line: "#3f4147", green: "#23a559"
+    bg: "#313338", card: "#2b2d31", inset: "#1e1f22", line: "#1e1f22",
+    muted: "#b5bac1", text: "#dbdee1", accent: "#5865f2",
+    danger: "#f23f43", green: "#23a559", link: "#00a8fc"
 };
 
 function Settings() {
-    var _s = storage;
-    var forceUpdate = React.useState(0);
-    var setUpdate = forceUpdate[1];
-    function refresh() { setUpdate(function (x) { return x + 1; }); }
+    var s = React.useState(0);
+    var force = s[1];
 
-    var aliases = normalizeAliases(_s.aliases);
-    var draftState = React.useState({ target: "", source: "" });
-    var draft = draftState[0];
-    var setDraft = draftState[1];
-    var previewMap = React.useState({});
-    var pMap = previewMap[0];
-    var setPMap = previewMap[1];
-    var saving = React.useState(false);
-    var isSaving = saving[0];
-    var setSaving = saving[1];
+    function refresh() {
+        force(function (n) { return n + 1; });
+        emitProfileStoreChange();
+    }
 
-    React.useEffect(function () {
-        var ids = [];
-        aliases.forEach(function (a) { ids.push(a.targetUserId, a.sourceUserId); });
-        var t = draft.target ? extractUserId(draft.target) : null;
-        var s = draft.source ? extractUserId(draft.source) : null;
-        if (t) ids.push(t);
-        if (s) ids.push(s);
-        ids = Array.from(new Set(ids.filter(Boolean)));
-        Promise.all(ids.map(function (id) {
-            return fetchUserPreview(id).then(function (p) { return [id, p]; }).catch(function () { return [id, null]; });
-        })).then(function (entries) {
-            var m = {};
-            entries.forEach(function (e) { m[e[0]] = e[1]; });
-            setPMap(m);
-        });
-    }, [aliases, draft.target, draft.source]);
+    var aliases = normalizeAliases(storage.aliases);
+    var draftTarget = storage._draftTarget || "";
+    var draftSource = storage._draftSource || "";
+
+    function section(title, body) {
+        return React.createElement(View, { style: { marginBottom: 16 } },
+            React.createElement(Text, {
+                style: { color: C.muted, fontSize: 12, fontWeight: "600", marginBottom: 6 }
+            }, title),
+            React.createElement(View, {
+                style: { backgroundColor: C.card, borderRadius: 8, borderWidth: 1, borderColor: "#202225", overflow: "hidden" }
+            }, body)
+        );
+    }
+
+    function field(label, value, onText, isFirst) {
+        return React.createElement(View, {
+            style: { paddingHorizontal: 12, paddingVertical: 12, borderTopWidth: isFirst ? 0 : 1, borderTopColor: C.line }
+        },
+            React.createElement(Text, { style: { color: C.muted, fontSize: 12, marginBottom: 6, fontWeight: "600" } }, label),
+            React.createElement(TextInput, {
+                style: { backgroundColor: C.inset, color: C.text, borderRadius: 6, borderWidth: 1, borderColor: "#111214", paddingHorizontal: 10, paddingVertical: 9, fontSize: 15 },
+                placeholder: label,
+                placeholderTextColor: "#6d6f78",
+                value: value,
+                autoCorrect: false,
+                autoCapitalize: "none",
+                onChangeText: onText
+            })
+        );
+    }
 
     function addAlias() {
-        var tid = extractUserId(draft.target);
-        var sid = extractUserId(draft.source);
-        if (!tid || !sid) { showToast("enter valid ids", getAssetIDByName("Small")); return; }
+        var tid = extractUserId(draftTarget);
+        var sid = extractUserId(draftSource);
+        if (!tid || !sid) { showToast("enter valid user ids", getAssetIDByName("Small")); return; }
         if (tid === sid) { showToast("use two different users", getAssetIDByName("Small")); return; }
         if (aliases.some(function (a) { return a.targetUserId === tid && a.sourceUserId === sid; })) {
             showToast("swap already exists", getAssetIDByName("Small")); return;
         }
-        setSaving(true);
-        Promise.all([fetchUserPreview(tid), fetchUserPreview(sid)]).then(function (results) {
-            if (!results[0] || !results[1]) {
-                showToast("could not find one of those users", getAssetIDByName("Small"));
-                setSaving(false);
-                return;
+        var enable = !aliases.some(function (a) { return a.enabled && a.targetUserId === tid; });
+        storage.aliases = normalizeAliases(storage.aliases).concat([createAlias(tid, sid, enable)]);
+        storage._draftTarget = "";
+        storage._draftSource = "";
+        refreshAliases();
+        refresh();
+        showToast("swap saved" + (enable ? "" : " (disabled — user already active)"), getAssetIDByName("Check"));
+    }
+
+    function aliasRow(alias) {
+        var on = alias.enabled;
+        return React.createElement(Pressable, {
+            key: alias.id,
+            onPress: function () {
+                if (on) {
+                    storage.aliases = normalizeAliases(storage.aliases).map(function (a) {
+                        return a.id === alias.id ? Object.assign({}, a, { enabled: false }) : a;
+                    });
+                } else {
+                    storage.aliases = normalizeAliases(storage.aliases).map(function (a) {
+                        return Object.assign({}, a, {
+                            enabled: a.id === alias.id ? true : a.targetUserId === alias.targetUserId ? false : a.enabled
+                        });
+                    });
+                }
+                refreshAliases();
+                refresh();
+            },
+            style: {
+                flexDirection: "row",
+                alignItems: "center",
+                paddingHorizontal: 12,
+                paddingVertical: 11,
+                borderTopWidth: 1,
+                borderTopColor: C.line,
+                backgroundColor: on ? "#383a40" : "transparent"
             }
-            var enable = !aliases.some(function (a) { return a.enabled && a.targetUserId === tid; });
-            _s.aliases = normalizeAliases(_s.aliases).concat([createAlias(tid, sid, enable)]);
-            setDraft({ target: "", source: "" });
-            if (!enable) showToast("saved disabled (user already active)", getAssetIDByName("Check"));
-            refreshAliases();
+        },
+            React.createElement(Text, {
+                style: { color: on ? C.accent : C.muted, fontSize: 14, width: 20, marginRight: 6 }
+            }, on ? "☑" : "☐"),
+            React.createElement(View, { style: { flex: 1, minWidth: 0 } },
+                React.createElement(Text, { numberOfLines: 1, style: { color: C.text, fontSize: 14, fontWeight: "600" } }, alias.targetUserId),
+                React.createElement(Text, { numberOfLines: 1, style: { color: C.muted, fontSize: 12 } }, "← " + alias.sourceUserId)),
+            React.createElement(Pressable, {
+                onPress: function () {
+                    storage.aliases = normalizeAliases(storage.aliases).filter(function (a) { return a.id !== alias.id; });
+                    refreshAliases();
+                    refresh();
+                },
+                style: { backgroundColor: C.danger, borderRadius: 6, paddingVertical: 6, paddingHorizontal: 10, marginLeft: 8 }
+            }, React.createElement(Text, { style: { color: "#fff", fontSize: 12, fontWeight: "600" } }, "del"))
+        );
+    }
+
+    var newSwapBlock = React.createElement(View, null,
+        field("User ID to change", draftTarget, function (v) {
+            storage._draftTarget = v;
             refresh();
-        }).catch(function () {
-            showToast("error", getAssetIDByName("Small"));
-        }).finally(function () { setSaving(false); });
-    }
+        }, true),
+        field("User ID to copy from", draftSource, function (v) {
+            storage._draftSource = v;
+            refresh();
+        }),
+        React.createElement(Pressable, {
+            onPress: addAlias,
+            style: {
+                borderTopWidth: 1,
+                borderTopColor: C.line,
+                paddingVertical: 12,
+                alignItems: "center",
+                backgroundColor: C.accent
+            }
+        }, React.createElement(Text, { style: { color: "#fff", fontSize: 13, fontWeight: "600" } }, "save swap"))
+    );
 
-    function toggleEnabled(aliasId, aliasTargetUserId, checked) {
-        if (checked) {
-            _s.aliases = normalizeAliases(_s.aliases).map(function (a) {
-                return Object.assign({}, a, { enabled: a.id === aliasId ? true : a.targetUserId === aliasTargetUserId ? false : a.enabled });
-            });
-        } else {
-            _s.aliases = normalizeAliases(_s.aliases).map(function (a) {
-                return a.id === aliasId ? Object.assign({}, a, { enabled: false }) : a;
-            });
-        }
-        refreshAliases();
-        refresh();
-    }
+    var savedBlock = aliases.length === 0
+        ? React.createElement(View, {
+            style: { paddingVertical: 14, paddingHorizontal: 12, alignItems: "center" }
+        }, React.createElement(Text, { style: { color: C.muted, fontSize: 13 } }, "no swaps yet"))
+        : React.createElement(View, null, aliases.map(aliasRow));
 
-    function deleteAlias(id) {
-        _s.aliases = normalizeAliases(_s.aliases).filter(function (a) { return a.id !== id; });
-        refreshAliases();
-        refresh();
-    }
-
-    function renderPreview(userId) {
-        var p = pMap[userId];
-        if (p && p.avatarUrl) {
-            return React.createElement(Image, { source: { uri: p.avatarUrl }, style: { width: 32, height: 32, borderRadius: 16, backgroundColor: C.bg2 } });
-        }
-        return React.createElement(View, { style: { width: 32, height: 32, borderRadius: 16, backgroundColor: C.bg2, alignItems: "center", justifyContent: "center" } },
-            React.createElement(Text, { style: { color: C.muted, fontSize: 13, fontWeight: "700" } }, userId.slice(0, 1).toUpperCase()));
-    }
-
-    function renderUserLine(userId) {
-        var p = pMap[userId];
-        var name = p ? p.displayName : userId;
-        var meta = p ? "@" + p.username : "";
-        return React.createElement(View, { style: { flexDirection: "row", alignItems: "center", flex: 1, minWidth: 0, backgroundColor: C.inset, borderRadius: 6, paddingHorizontal: 8, paddingVertical: 6 } },
-            renderPreview(userId),
-            React.createElement(View, { style: { flex: 1, minWidth: 0, marginLeft: 8 } },
-                React.createElement(Text, { numberOfLines: 1, style: { color: C.text, fontSize: 14, fontWeight: "600" } }, name),
-                meta ? React.createElement(Text, { numberOfLines: 1, style: { color: C.muted, fontSize: 12 } }, meta) : null));
-    }
-
-    function section(label, content) {
-        return React.createElement(View, { style: { marginBottom: 12 } },
-            React.createElement(Text, { style: { color: C.muted, fontSize: 11, fontWeight: "700", letterSpacing: 0.5, marginBottom: 6, textTransform: "uppercase" } }, label),
-            content);
-    }
-
-    return React.createElement(ScrollView, { style: { flex: 1, backgroundColor: C.bg }, contentContainerStyle: { padding: 16, paddingBottom: 64 } },
+    return React.createElement(ScrollView, {
+        style: { flex: 1, backgroundColor: C.bg },
+        contentContainerStyle: { padding: 16, paddingBottom: 64 }
+    },
         React.createElement(Text, { style: { color: C.text, fontSize: 20, fontWeight: "700" } }, "Wow"),
         React.createElement(Text, { style: { color: C.muted, fontSize: 13, marginTop: 2, marginBottom: 16 } }, "Swap user identities locally."),
-        section("New Swap", React.createElement(View, null,
-            React.createElement(View, { style: { flexDirection: "row", marginBottom: 8 } },
-                React.createElement(View, { style: { flex: 1, marginRight: 4 } },
-                    React.createElement(TextInput, {
-                        style: { backgroundColor: C.inset, color: C.text, borderRadius: 6, borderWidth: 1, borderColor: "#111214", paddingHorizontal: 10, paddingVertical: 9, fontSize: 15 },
-                        placeholder: "user to change", placeholderTextColor: "#6d6f78",
-                        autoCorrect: false, autoCapitalize: "none",
-                        value: draft.target,
-                        onChangeText: function (v) { setDraft(function (d) { return { target: v, source: d.source }; }); }
-                    })),
-                React.createElement(View, { style: { flex: 1, marginLeft: 4 } },
-                    React.createElement(TextInput, {
-                        style: { backgroundColor: C.inset, color: C.text, borderRadius: 6, borderWidth: 1, borderColor: "#111214", paddingHorizontal: 10, paddingVertical: 9, fontSize: 15 },
-                        placeholder: "user to copy", placeholderTextColor: "#6d6f78",
-                        autoCorrect: false, autoCapitalize: "none",
-                        value: draft.source,
-                        onChangeText: function (v) { setDraft(function (d) { return { target: d.target, source: v }; }); }
-                    }))),
-            React.createElement(TouchableOpacity, {
-                onPress: addAlias,
-                activeOpacity: 0.7,
-                style: { backgroundColor: isSaving ? C.bg2 : C.brand, borderRadius: 6, paddingVertical: 10, paddingHorizontal: 14, alignItems: "center" }
-            }, React.createElement(Text, { style: { color: "#fff", fontSize: 13, fontWeight: "600" } }, isSaving ? "saving..." : "save swap")))),
-        section("Saved (" + aliases.length + ")", aliases.length === 0
-            ? React.createElement(View, { style: { borderWidth: 1, borderColor: C.line, borderRadius: 6, borderStyle: "dashed", backgroundColor: C.bg2, padding: 12, alignItems: "center" } },
-                React.createElement(Text, { style: { color: C.muted, fontSize: 13 } }, "no swaps yet."))
-            : React.createElement(View, null, aliases.map(function (alias) {
-                var hasConflict = !alias.enabled && aliases.some(function (a) { return a.id !== alias.id && a.enabled && a.targetUserId === alias.targetUserId; });
-                return React.createElement(View, { key: alias.id, style: { flexDirection: "row", alignItems: "center", backgroundColor: C.bg2, borderWidth: 1, borderColor: C.line, borderRadius: 6, padding: 10, marginBottom: 6 } },
-                    React.createElement(View, { style: { flexDirection: "row", flex: 1, alignItems: "center", minWidth: 0 } },
-                        renderUserLine(alias.targetUserId),
-                        React.createElement(Text, { style: { color: C.muted, fontSize: 12, fontWeight: "700", marginHorizontal: 6 } }, "→"),
-                        renderUserLine(alias.sourceUserId)),
-                    React.createElement(View, { style: { flexDirection: "row", alignItems: "center" } },
-                        React.createElement(TouchableOpacity, {
-                            onPress: function () { toggleEnabled(alias.id, alias.targetUserId, !alias.enabled); },
-                            activeOpacity: 0.7,
-                            style: { width: 36, height: 20, borderRadius: 10, backgroundColor: alias.enabled ? C.green : C.line, alignItems: "center", justifyContent: alias.enabled ? "flex-end" : "flex-start", paddingHorizontal: 2 }
-                        }, React.createElement(View, { style: { width: 16, height: 16, borderRadius: 8, backgroundColor: "#fff" } })),
-                        React.createElement(TouchableOpacity, {
-                            onPress: function () { deleteAlias(alias.id); },
-                            activeOpacity: 0.7,
-                            style: { backgroundColor: C.danger, borderRadius: 6, paddingVertical: 6, paddingHorizontal: 10, marginLeft: 8 }
-                        }, React.createElement(Text, { style: { color: "#fff", fontSize: 12, fontWeight: "600" } }, "del"))),
-                    hasConflict ? React.createElement(Text, { style: { color: "#faa81a", fontSize: 11, marginTop: 2 } }, "another swap for this user is active") : null);
-            }))));
+        section("New Swap", newSwapBlock),
+        section("Saved (" + aliases.length + ")", savedBlock)
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
