@@ -953,14 +953,16 @@ function getMirroredGlobalName(user) {
 }
 
 function mirroredName(user) {
-    var gn = getMirroredGlobalName(user);
+    var u = unwrapAliasedUserProxy(user) || user;
+    var gn = getMirroredGlobalName(u);
     if (typeof gn === "string" && gn.length > 0) return gn;
-    return getMirroredUsername(user);
+    return getMirroredUsername(u);
 }
 
 function getMirroredUserTag(user, fallback) {
-    if (!user || !user.id) return fallback || "";
-    var username = getMirroredUsername(user);
+    var u = unwrapAliasedUserProxy(user) || user;
+    if (!u || !u.id) return fallback || "";
+    var username = getMirroredUsername(u);
     if (typeof username === "string" && username.length > 0) return username;
     return fallback || "";
 }
@@ -1039,8 +1041,26 @@ function getAliasedUserView(user, opts) {
     var mp = buildMirroredProfileData(sourceUser, sourceProfile, sourceSnapshot, (sourceProfile) || (sourceSnapshot ? sourceSnapshot.rawProfile : null));
     var hasPrem = hasMirroredPremiumProfile(mp);
 
+    // Re-entrancy guard for the Proxy get trap itself — prevents infinite
+    // recursion when a mirrored-name helper (e.g. getMirroredUsername)
+    // accesses .id on a user object that turns out to be this proxy.
+    var inGetTrap = 0;
+
     var proxy = new Proxy(rawUser, {
         get: function (target, prop, receiver) {
+            // Guard: if we're already inside this get trap, fall through to
+            // Reflect to break the recursion cycle.
+            if (inGetTrap > 0) return Reflect.get(target, prop, receiver);
+            inGetTrap++;
+            try {
+
+            // Skip Symbol and internal properties that can trigger implicit access
+            if (typeof prop === "symbol") return Reflect.get(target, prop, receiver);
+            if (prop === "toString" || prop === "valueOf" || prop === "toJSON"
+                || prop === Symbol.toPrimitive || prop === Symbol.toStringTag) {
+                return Reflect.get(target, prop, receiver);
+            }
+
             // Preserve account-critical fields for current user
             if (opts.preserveAccountFields && typeof prop === "string") {
                 if (accountFieldKeys.has(prop)) {
@@ -1052,10 +1072,12 @@ function getAliasedUserView(user, opts) {
                 }
             }
 
-            if (prop === "username") return getMirroredUsername(user);
-            if (prop === "globalName") return getMirroredGlobalName(user);
-            if (prop === "displayName") return mirroredName(user);
-            if (prop === "tag") return getMirroredUserTag(user, Reflect.get(target, prop, receiver));
+            // IMPORTANT: always pass rawUser (unwrapped) to mirrored-name helpers,
+            // never the potentially-proxied `user` argument, to avoid infinite loops.
+            if (prop === "username") return getMirroredUsername(rawUser);
+            if (prop === "globalName") return getMirroredGlobalName(rawUser);
+            if (prop === "displayName") return mirroredName(rawUser);
+            if (prop === "tag") return getMirroredUserTag(rawUser, Reflect.get(target, prop, receiver));
             if (prop === "discriminator") {
                 if (sourceUsersByTargetId.has(targetId) || sourceSnapshotsByTargetId.has(targetId)) return "0";
                 return Reflect.get(target, prop, receiver);
@@ -1109,6 +1131,8 @@ function getAliasedUserView(user, opts) {
             }
 
             return Reflect.get(target, prop, receiver);
+
+            } finally { inGetTrap--; }
         },
         ownKeys: function (target) {
             return Reflect.ownKeys(target);
@@ -1975,7 +1999,8 @@ function patchRuntimeGetters() {
             var id = args[0];
             var src = typeof id === "string" ? sourceUsersByTargetId.get(id) : null;
             var snap = typeof id === "string" ? sourceSnapshotsByTargetId.get(id) : null;
-            return SnowflakeUtils.extractTimestamp.call(SnowflakeUtils, src ? src.id : (snap ? snap.sourceUserId : id));
+            var rawSrc = src ? unwrapAliasedUserProxy(src) || src : null;
+            return SnowflakeUtils.extractTimestamp.call(SnowflakeUtils, rawSrc ? rawSrc.id : (snap ? snap.sourceUserId : id));
         }));
     }
 
@@ -2184,6 +2209,12 @@ var C = {
 function Settings() {
     var s = React.useState(0);
     var force = s[1];
+    var ds = React.useState("");
+    var draftTarget = ds[0];
+    var setDraftTarget = ds[1];
+    var ds2 = React.useState("");
+    var draftSource = ds2[0];
+    var setDraftSource = ds2[1];
 
     function refresh() {
         force(function (n) { return n + 1; });
@@ -2191,8 +2222,6 @@ function Settings() {
     }
 
     var aliases = normalizeAliases(storage.aliases);
-    var draftTarget = storage._draftTarget || "";
-    var draftSource = storage._draftSource || "";
 
     function section(title, body) {
         return React.createElement(View, { style: { marginBottom: 16 } },
@@ -2231,9 +2260,11 @@ function Settings() {
             showToast("swap already exists", getAssetIDByName("Small")); return;
         }
         var enable = !aliases.some(function (a) { return a.enabled && a.targetUserId === tid; });
+        // Write aliases to storage FIRST (synchronous, persisted immediately)
         storage.aliases = normalizeAliases(storage.aliases).concat([createAlias(tid, sid, enable)]);
-        storage._draftTarget = "";
-        storage._draftSource = "";
+        // Clear draft fields (local state, not storage)
+        setDraftTarget("");
+        setDraftSource("");
         refreshAliases();
         refresh();
         showToast("swap saved" + (enable ? "" : " (disabled — user already active)"), getAssetIDByName("Check"));
@@ -2287,12 +2318,10 @@ function Settings() {
 
     var newSwapBlock = React.createElement(View, null,
         field("User ID to change", draftTarget, function (v) {
-            storage._draftTarget = v;
-            refresh();
+            setDraftTarget(v);
         }, true),
         field("User ID to copy from", draftSource, function (v) {
-            storage._draftSource = v;
-            refresh();
+            setDraftSource(v);
         }),
         React.createElement(Pressable, {
             onPress: addAlias,
