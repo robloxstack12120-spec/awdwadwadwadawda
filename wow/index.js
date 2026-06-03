@@ -71,6 +71,8 @@ var suppressUserUpdateEvents = 0;
 var isSyncing = false;
 var syncQueued = false;
 var inGetAliasedUserView = 0;
+var mirrorDepth = 0;
+var globalInGetTrap = 0; // global re-entrancy guard for ALL proxy get traps
 var nextRestRequestAt = 0;
 var restQueue = Promise.resolve();
 
@@ -176,6 +178,10 @@ function extractUserId(v) {
 function cloneLoose(v, seen) {
     if (v == null) return null;
     if (typeof v !== "object") return v;
+    // Unwrap any aliased user Proxy before cloning — Object.assign on a Proxy
+    // iterates its properties via the get trap, which can cause recursion.
+    var raw = unwrapAliasedUserProxy(v);
+    if (raw && raw !== v) v = raw;
     if (v instanceof Date) {
         try { return new Date(v.getTime()); } catch (_) { return null; }
     }
@@ -194,11 +200,17 @@ function cloneLoose(v, seen) {
 }
 
 function cloneDiscordRecord(rec) {
+    // Unwrap any aliased user Proxy before cloning
+    var raw = unwrapAliasedUserProxy(rec);
+    if (raw && raw !== rec) rec = raw;
     return Object.assign(Object.create(Object.getPrototypeOf(rec) || Object.prototype), rec);
 }
 
 function deepCloneRecord(rec, seen) {
     if (!rec || typeof rec !== "object") return rec;
+    // Unwrap any Proxy before deep cloning
+    var raw = unwrapAliasedUserProxy(rec);
+    if (raw && raw !== rec) rec = raw;
     seen = seen || new WeakMap();
     var cached = seen.get(rec);
     if (cached) return cached;
@@ -718,6 +730,10 @@ function buildAliasedProfile(targetUserId, mp, sourceRecord) {
 // ─── ID Rewriting ────────────────────────────────────────────────────────
 function rewriteIds(obj, from, to, depth) {
     if (!obj || typeof obj !== "object" || depth > 14) return;
+    // Unwrap any aliased user Proxy before walking — prevents proxy get trap
+    // recursion during Object.keys and property access
+    var raw = unwrapAliasedUserProxy(obj);
+    if (raw && raw !== obj) obj = raw;
     if (Array.isArray(obj)) {
         for (var i = 0; i < obj.length; i++) {
             if (obj[i] && typeof obj[i] === "object") rewriteIds(obj[i], from, to, depth + 1);
@@ -774,7 +790,19 @@ function getRawUserProfile(userId) {
 }
 
 function getCurrentUserId() {
-    try { return UserStore && UserStore.getCurrentUser ? UserStore.getCurrentUser().id : null; } catch (_) { return null; }
+    // Use the original (unpatched) method to avoid accessing Proxy properties
+    try {
+        if (_origGetCurrentUser) {
+            var raw = _origGetCurrentUser();
+            return raw ? raw.id : null;
+        }
+        if (UserStore && UserStore.getCurrentUser) {
+            var u = UserStore.getCurrentUser();
+            var ru = unwrapAliasedUserProxy(u) || u;
+            return ru ? ru.id : null;
+        }
+        return null;
+    } catch (_) { return null; }
 }
 
 function getNativeGuildMember(guildId, userId) {
@@ -924,6 +952,9 @@ function readDiscordGlobalName(u) {
 }
 
 function getMirroredUsername(user) {
+    if (mirrorDepth > 8) return readDiscordUsername(unwrapAliasedUserProxy(user) || user);
+    mirrorDepth++;
+    try {
     var u = unwrapAliasedUserProxy(user) || user;
     if (!u || !u.id) return readDiscordUsername(u);
     var mappedSource = sourceUsersByTargetId.get(u.id);
@@ -935,9 +966,13 @@ function getMirroredUsername(user) {
     var snap = sourceSnapshotsByTargetId.get(u.id);
     if (snap && typeof snap.username === "string" && snap.username.length > 0) return snap.username;
     return readDiscordUsername(u);
+    } finally { mirrorDepth--; }
 }
 
 function getMirroredGlobalName(user) {
+    if (mirrorDepth > 8) return readDiscordGlobalName(unwrapAliasedUserProxy(user) || user);
+    mirrorDepth++;
+    try {
     var u = unwrapAliasedUserProxy(user) || user;
     if (!u || !u.id) return readDiscordGlobalName(u);
     var mappedSource = sourceUsersByTargetId.get(u.id);
@@ -950,21 +985,30 @@ function getMirroredGlobalName(user) {
     if (snap && typeof snap.globalName === "string" && snap.globalName.length > 0) return snap.globalName;
     if (sourceUsersByTargetId.has(u.id) || sourceSnapshotsByTargetId.has(u.id)) return null;
     return readDiscordGlobalName(u);
+    } finally { mirrorDepth--; }
 }
 
 function mirroredName(user) {
+    if (mirrorDepth > 8) { var u0 = unwrapAliasedUserProxy(user) || user; return u0 ? (u0.globalName || u0.username || "") : ""; }
+    mirrorDepth++;
+    try {
     var u = unwrapAliasedUserProxy(user) || user;
     var gn = getMirroredGlobalName(u);
     if (typeof gn === "string" && gn.length > 0) return gn;
     return getMirroredUsername(u);
+    } finally { mirrorDepth--; }
 }
 
 function getMirroredUserTag(user, fallback) {
+    if (mirrorDepth > 8) return fallback || readDiscordUsername(unwrapAliasedUserProxy(user) || user);
+    mirrorDepth++;
+    try {
     var u = unwrapAliasedUserProxy(user) || user;
     if (!u || !u.id) return fallback || "";
     var username = getMirroredUsername(u);
     if (typeof username === "string" && username.length > 0) return username;
     return fallback || "";
+    } finally { mirrorDepth--; }
 }
 
 // ─── Proxy User View ─────────────────────────────────────────────────────
@@ -1041,30 +1085,31 @@ function getAliasedUserView(user, opts) {
     var mp = buildMirroredProfileData(sourceUser, sourceProfile, sourceSnapshot, (sourceProfile) || (sourceSnapshot ? sourceSnapshot.rawProfile : null));
     var hasPrem = hasMirroredPremiumProfile(mp);
 
-    // Re-entrancy guard for the Proxy get trap itself — prevents infinite
-    // recursion when a mirrored-name helper (e.g. getMirroredUsername)
-    // accesses .id on a user object that turns out to be this proxy.
-    var inGetTrap = 0;
-
+    // CRITICAL: Use 'target' (the raw user object) as the receiver in ALL
+    // Reflect.get calls inside this trap.  Using the Proxy as receiver causes
+    // prototype getters to execute with this === Proxy, which re-enters the
+    // get trap — even with the globalInGetTrap guard the guard itself calls
+    // Reflect.get(…, receiver) which calls the getter again → infinite loop.
     var proxy = new Proxy(rawUser, {
         get: function (target, prop, receiver) {
-            // Guard: if we're already inside this get trap, fall through to
-            // Reflect to break the recursion cycle.
-            if (inGetTrap > 0) return Reflect.get(target, prop, receiver);
-            inGetTrap++;
+            // Guard: if we're already inside ANY proxy get trap, fall through to
+            // Reflect.get with target as receiver to break ALL recursion cycles
+            // (including cross-proxy recursion and prototype-getter re-entry).
+            if (globalInGetTrap > 0) return Reflect.get(target, prop, target);
+            globalInGetTrap++;
             try {
 
             // Skip Symbol and internal properties that can trigger implicit access
-            if (typeof prop === "symbol") return Reflect.get(target, prop, receiver);
+            if (typeof prop === "symbol") return Reflect.get(target, prop, target);
             if (prop === "toString" || prop === "valueOf" || prop === "toJSON"
                 || prop === Symbol.toPrimitive || prop === Symbol.toStringTag) {
-                return Reflect.get(target, prop, receiver);
+                return Reflect.get(target, prop, target);
             }
 
             // Preserve account-critical fields for current user
             if (opts.preserveAccountFields && typeof prop === "string") {
                 if (accountFieldKeys.has(prop)) {
-                    return Reflect.get(target, prop, receiver);
+                    return Reflect.get(target, prop, target);
                 }
                 var ownDesc = Object.getOwnPropertyDescriptor(target, prop);
                 if (ownDesc && ownDesc.configurable === false && "value" in ownDesc) {
@@ -1077,21 +1122,21 @@ function getAliasedUserView(user, opts) {
             if (prop === "username") return getMirroredUsername(rawUser);
             if (prop === "globalName") return getMirroredGlobalName(rawUser);
             if (prop === "displayName") return mirroredName(rawUser);
-            if (prop === "tag") return getMirroredUserTag(rawUser, Reflect.get(target, prop, receiver));
+            if (prop === "tag") return getMirroredUserTag(rawUser, Reflect.get(target, prop, target));
             if (prop === "discriminator") {
                 if (sourceUsersByTargetId.has(targetId) || sourceSnapshotsByTargetId.has(targetId)) return "0";
-                return Reflect.get(target, prop, receiver);
+                return Reflect.get(target, prop, target);
             }
-            if (prop === "avatar") return (sourceUser ? sourceUser.avatar : null) || (sourceSnapshot ? sourceSnapshot.avatar : null) || Reflect.get(target, prop, receiver);
-            if (prop === "avatarDecoration") return (sourceUser ? sourceUser.avatarDecoration : null) || (sourceSnapshot ? sourceSnapshot.avatarDecoration : null) || Reflect.get(target, prop, receiver);
-            if (prop === "avatarDecorationData") return (sourceUser ? sourceUser.avatarDecorationData : null) || (sourceSnapshot ? sourceSnapshot.avatarDecorationData : null) || Reflect.get(target, prop, receiver);
+            if (prop === "avatar") return (sourceUser ? sourceUser.avatar : null) || (sourceSnapshot ? sourceSnapshot.avatar : null) || Reflect.get(target, prop, target);
+            if (prop === "avatarDecoration") return (sourceUser ? sourceUser.avatarDecoration : null) || (sourceSnapshot ? sourceSnapshot.avatarDecoration : null) || Reflect.get(target, prop, target);
+            if (prop === "avatarDecorationData") return (sourceUser ? sourceUser.avatarDecorationData : null) || (sourceSnapshot ? sourceSnapshot.avatarDecorationData : null) || Reflect.get(target, prop, target);
             if (prop === "premiumType" || prop === "premium_type") return mp.premiumType || 0;
             if (prop === "premiumSince" || prop === "premium_since") return serializeProfileDate(mp.premiumSince);
             if (prop === "premiumGuildSince" || prop === "premium_guild_since") return serializeProfileDate(mp.premiumGuildSince);
             if (prop === "accentColor" || prop === "accent_color") return mp.accentColor;
 
             if (typeof prop === "string" && premiumBoolKeys.has(prop)) {
-                var curVal = Reflect.get(target, prop, receiver);
+                var curVal = Reflect.get(target, prop, target);
                 return typeof curVal === "function" ? function () { return hasPrem; } : hasPrem;
             }
 
@@ -1108,7 +1153,7 @@ function getAliasedUserView(user, opts) {
             if (typeof prop === "string" && isGuildTagLikeKey(prop)) {
                 if (sourceUser && prop in sourceUser) return cloneLoose(sourceUser[prop]);
                 if (sourceSnapshot && sourceSnapshot.tagFields && prop in sourceSnapshot.tagFields) return cloneLoose(sourceSnapshot.tagFields[prop]);
-                var cv = Reflect.get(target, prop, receiver);
+                var cv = Reflect.get(target, prop, target);
                 return cv == null ? cv : emptyMirroredValue(cv);
             }
 
@@ -1130,18 +1175,42 @@ function getAliasedUserView(user, opts) {
                 };
             }
 
-            return Reflect.get(target, prop, receiver);
+            return Reflect.get(target, prop, target);
 
-            } finally { inGetTrap--; }
+            } finally { globalInGetTrap--; }
         },
         ownKeys: function (target) {
             return Reflect.ownKeys(target);
         },
         getOwnPropertyDescriptor: function (target, prop) {
-            return Object.getOwnPropertyDescriptor(target, prop);
+            var desc = Object.getOwnPropertyDescriptor(target, prop);
+            if (!desc) return desc;
+            // For intercepted properties, return a data descriptor with the
+            // mirrored value to stay consistent with the get trap.
+            // Some engines (Hermes) may validate get vs descriptor consistency.
+            if (typeof prop === "string" && !desc.configurable && "value" in desc) return desc; // non-configurable: must be accurate
+            if (typeof prop === "string" && (
+                prop === "username" || prop === "globalName" || prop === "displayName" ||
+                prop === "tag" || prop === "discriminator" || prop === "avatar" ||
+                prop === "avatarDecoration" || prop === "avatarDecorationData" ||
+                prop === "premiumType" || prop === "premium_type" ||
+                prop === "premiumSince" || prop === "premium_since" ||
+                prop === "premiumGuildSince" || prop === "premium_guild_since" ||
+                prop === "accentColor" || prop === "accent_color" ||
+                prop === "getAvatarURL" || prop === "getAvatarSource"
+            )) {
+                // Return a configurable data descriptor — the Proxy get trap
+                // controls the actual value, so we must report it as configurable
+                // to avoid invariant violations in strict engines.
+                return { configurable: true, enumerable: desc.enumerable, writable: true, value: undefined };
+            }
+            return desc;
         },
         has: function (target, prop) {
             return prop in target;
+        },
+        getPrototypeOf: function (target) {
+            return Object.getPrototypeOf(target);
         }
     });
 
@@ -1152,13 +1221,24 @@ function getAliasedUserView(user, opts) {
 }
 
 // ─── Snapshot Helpers ────────────────────────────────────────────────────
+var inGetAvatarUrlForUser = 0; // re-entrancy guard to prevent prototype-method chains
+
 function getAvatarUrlForUser(user) {
-    try { if (typeof user.getAvatarURL === "function") return user.getAvatarURL(undefined, 128, false); } catch (_) {}
+    // Prevent infinite chain: if a source user's getAvatarURL (patched prototype)
+    // calls getAvatarUrlForUser on another source which also has an alias, stop.
+    if (inGetAvatarUrlForUser > 0) {
+        // Fall back to the original unpatched method to break the chain
+        try { return originalPrototypeGetAvatarURL ? originalPrototypeGetAvatarURL.apply(user, [undefined, 128, false]) : ""; } catch (_) { return ""; }
+    }
+    inGetAvatarUrlForUser++;
     try {
-        return IconUtils && IconUtils.getUserAvatarURL
-            ? IconUtils.getUserAvatarURL(user, undefined, 128, undefined)
-            : "";
-    } catch (_) { return ""; }
+        try { if (typeof user.getAvatarURL === "function") return user.getAvatarURL(undefined, 128, false); } catch (_) {}
+        try {
+            return IconUtils && IconUtils.getUserAvatarURL
+                ? IconUtils.getUserAvatarURL(user, undefined, 128, undefined)
+                : "";
+        } catch (_) { return ""; }
+    } finally { inGetAvatarUrlForUser--; }
 }
 
 function createUserAliasSnapshot(sourceUser, sourceProfile, previousSnapshot) {
@@ -1810,26 +1890,38 @@ function patchRuntimeGetters() {
     }
 
     // ── User prototype getAvatarURL / getAvatarSource ──────────────────
-    var curUser = UserStore && UserStore.getCurrentUser ? UserStore.getCurrentUser() : null;
+    // Use getRawUser to avoid getting a Proxy back from the patched getCurrentUser
+    var curUser = getRawUser(getCurrentUserId());
     var userProto = curUser ? Object.getPrototypeOf(curUser) : null;
     if (userProto && !patchedUserPrototype) {
         patchedUserPrototype = userProto;
         if (typeof userProto.getAvatarURL === "function") {
             originalPrototypeGetAvatarURL = userProto.getAvatarURL;
             userProto.getAvatarURL = function () {
-                var src = this && this.id ? sourceUsersByTargetId.get(this.id) : null;
-                var snap = this && this.id ? sourceSnapshotsByTargetId.get(this.id) : null;
+                // Guard: unwrap 'this' in case it's a Proxy
+                var rawThis = unwrapAliasedUserProxy(this) || this;
+                var src = rawThis && rawThis.id ? sourceUsersByTargetId.get(rawThis.id) : null;
+                var snap = rawThis && rawThis.id ? sourceSnapshotsByTargetId.get(rawThis.id) : null;
                 if (src) return getAvatarUrlForUser(src);
                 if (snap && snap.avatarUrl) return snap.avatarUrl;
-                return originalPrototypeGetAvatarURL.apply(this, arguments);
+                return originalPrototypeGetAvatarURL.apply(rawThis, arguments);
             };
         }
         if (typeof userProto.getAvatarSource === "function") {
             originalPrototypeGetAvatarSource = userProto.getAvatarSource;
             userProto.getAvatarSource = function () {
-                var src = this && this.id ? sourceUsersByTargetId.get(this.id) : null;
-                if (src && typeof src.getAvatarSource === "function") return src.getAvatarSource.apply(src, arguments);
-                return originalPrototypeGetAvatarSource.apply(this, arguments);
+                // Guard: unwrap 'this' in case it's a Proxy, and use original
+                // method on the source to prevent chain recursion
+                var rawThis = unwrapAliasedUserProxy(this) || this;
+                var src = rawThis && rawThis.id ? sourceUsersByTargetId.get(rawThis.id) : null;
+                if (src) {
+                    var rawSrc = unwrapAliasedUserProxy(src) || src;
+                    // Call the ORIGINAL method on the source, not the patched one,
+                    // to prevent infinite chain through sourceUsersByTargetId lookups
+                    if (originalPrototypeGetAvatarSource) return originalPrototypeGetAvatarSource.apply(rawSrc, arguments);
+                    if (typeof rawSrc.getAvatarSource === "function") return rawSrc.getAvatarSource.apply(rawSrc, arguments);
+                }
+                return originalPrototypeGetAvatarSource.apply(rawThis, arguments);
             };
         }
     }
