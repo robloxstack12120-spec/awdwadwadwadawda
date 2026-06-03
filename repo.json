@@ -5,7 +5,7 @@
   },
   "wow": {
     "name": "Wow",
-    "description": "[v1.0.0] Wow: swap user identities locally — avatar, username, display name, badges, banner, bio, pronouns, premium.",
+    "description": "[v1.1.0] Wow: swap user identities locally — avatar, username, display name, badges, banner, bio, pronouns, premium.",
     "hash": "REPLACED_AT_BUILD_TIME"
   }
 }
